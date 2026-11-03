@@ -1,0 +1,12 @@
+[package]
+name = "nexxus-net"
+version = "0.1.0"
+edition = "2021"
+description = "NeXXXUs lab TCP mesh. HELLO v3 then sealed frames. No vault and no Tor yet."
+license = "MIT"
+
+[dependencies]
+nexxus-crypto = { path = "../nexxus-crypto" }
+getrandom = "0.2"
+hex = "0.4"
+serde_json = "1"

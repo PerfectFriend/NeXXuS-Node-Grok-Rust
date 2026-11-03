@@ -1,9 +1,15 @@
 # NeXXuS-Node-Grok-Rust
 
-Будущая нода NeXXXUs на Rust. Сейчас здесь план миграции и золотые векторы протокола, не рабочий узел.
+Нода NeXXXUs на Rust. Уже совпадает с Linux 0.10.0 в ключе, HELLO v3 и лабораторном чате по TCP. Сейфа, копий и Tor ещё нет.
 
-Эталон поведения — Linux-нода 0.10.0 в [NeXXXUs-Grok](https://github.com/PerfectFriend/NeXXXUs-Grok). Этот репозиторий не заменяет её, пока Rust-узел не пройдёт те же сценарии против неё.
+Эталон — [NeXXXUs-Grok](https://github.com/PerfectFriend/NeXXXUs-Grok). Этот репозиторий его не заменяет.
 
-План: [docs/MIGRATION.md](docs/MIGRATION.md). Порт сейфа идёт первым. Клиент Grok API в плане есть, но в канал и в журнал не входит и по умолчанию выключен.
+План: [docs/MIGRATION.md](docs/MIGRATION.md). Векторы: [vectors/nxx-vectors.json](vectors/nxx-vectors.json).
 
-Векторы ключей, HELLO v3 и кадра: [vectors/nxx-vectors.json](vectors/nxx-vectors.json).
+```bash
+cargo test
+NEXXUS_JS_DIR=/путь/к/linux-node cargo test --test js_pair
+cargo run -p nexxus -- start --port 4377
+```
+
+`nexxus start` слушает только `127.0.0.1`, печатает двенадцать слов один раз и не пишет их на диск. Каталога сейфа нет.

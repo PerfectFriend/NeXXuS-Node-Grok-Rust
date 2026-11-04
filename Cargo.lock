@@ -313,6 +313,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexxus-vault"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "hex",
+ "hkdf",
+ "nexxus-crypto",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

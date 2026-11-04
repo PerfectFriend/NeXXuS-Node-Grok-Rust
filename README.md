@@ -1,6 +1,6 @@
 # NeXXuS-Node-Grok-Rust
 
-Нода NeXXXUs на Rust. Уже совпадает с Linux 0.10.0 в ключе, HELLO v3 и лабораторном чате по TCP. Сейфа, копий и Tor ещё нет.
+Нода NeXXXUs на Rust. С Linux 0.10.0 уже сходятся ключи, HELLO v3, лабораторный чат и журнал `map.bin`: чанки по 16 КБ и локальное чтение файла. Реплик, льготы и Tor в Rust ещё нет. `nexxus start` по-прежнему только чат и не пишет сейф на диск.
 
 Эталон — [NeXXXUs-Grok](https://github.com/PerfectFriend/NeXXXUs-Grok). Этот репозиторий его не заменяет.
 

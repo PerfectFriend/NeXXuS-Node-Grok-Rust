@@ -2,9 +2,9 @@
 name = "nexxus"
 version = "0.1.0"
 edition = "2021"
-description = "NeXXXUs Rust node. Crypto matches Linux 0.10.0; the mesh is not listening yet."
+description = "NeXXXUs Rust node. Lab vault, replicas and HELLO v3. No Tor yet."
 license = "MIT"
 
 [dependencies]
 nexxus-crypto = { path = "../nexxus-crypto" }
-nexxus-net = { path = "../nexxus-net" }
+nexxus-node = { path = "../nexxus-node" }

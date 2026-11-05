@@ -1,6 +1,6 @@
 # NeXXuS-Node-Grok-Rust
 
-Нода NeXXXUs на Rust. С Linux 0.10.0 уже сходятся ключи, HELLO v3, лабораторный чат и журнал `map.bin`: чанки по 16 КБ и локальное чтение файла. Реплик, льготы и Tor в Rust ещё нет. `nexxus start` по-прежнему только чат и не пишет сейф на диск.
+Нода NeXXXUs на Rust. С Linux 0.10.0 сходятся ключи, HELLO v3, лабораторный чат, `identity.bin`, журнал `map.bin`, раскладка копии и проверка чанка. Льгота снимает молчащую копию локально. Tor ещё нет.
 
 Эталон — [NeXXXUs-Grok](https://github.com/PerfectFriend/NeXXXUs-Grok). Этот репозиторий его не заменяет.
 
@@ -8,8 +8,8 @@
 
 ```bash
 cargo test
-NEXXUS_JS_DIR=/путь/к/linux-node cargo test --test js_pair
-cargo run -p nexxus -- start --port 4377
+NEXXUS_JS_DIR=/путь/к/linux-node cargo test --test js_pair --test journal --test replica --test identity
+cargo run -p nexxus -- start --data ~/.nexxus-rs --port 4377
 ```
 
-`nexxus start` слушает только `127.0.0.1`, печатает двенадцать слов один раз и не пишет их на диск. Каталога сейфа нет.
+`nexxus start` слушает только `127.0.0.1`. Фраза печатается один раз и дальше лежит в `identity.bin`, закрытом `machine.key`. Второй запуск слова не показывает. Чужой контакт передаётся так: `--contact 'nexxus:1:…'`.

@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use nexxus_crypto::Identity;
-use nexxus_vault::{canon, map_locator, open_chunk, seal_chunk, Store};
+use nexxus_vault::{canon, open_chunk, seal_chunk, Store};
 
 const PHRASE: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 const DEVICE: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -46,10 +46,28 @@ fn chunk_nonce_changes_ciphertext() {
 }
 
 #[test]
-fn locator_is_sha256_of_vault_key() {
+fn pin_then_grace_then_proof() {
+    let dir = std::env::temp_dir().join(format!("nxx-grace-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
     let identity = Identity::from_mnemonic(PHRASE).unwrap();
-    let locator = map_locator(&identity.vault_key);
-    assert_eq!(locator.len(), 64);
+    let mut store = Store::create(&dir, identity, DEVICE).unwrap();
+    store.add_file("f", "a.txt", b"grace").unwrap();
+    let planned = store.plan_replica("f", 1).unwrap();
+    let holder = nexxus_vault::Holder {
+        fingerprint: "nxx1holder".into(),
+        host: "127.0.0.1".into(),
+        port: 1,
+        pub_hex: "ab".into(),
+    };
+    store.pin_replica("f", &planned, &holder, 1_000).unwrap();
+    assert_eq!(store.stale_replicas(100, 1_200).unwrap().len(), 1);
+    let proof = store.proof_for("f", 1, 0, b"challenge-bytes").unwrap();
+    assert_eq!(proof.len(), 64);
+    store.note_seen("f", 1, 2_000).unwrap();
+    assert!(store.stale_replicas(100, 2_050).unwrap().is_empty());
+    store.unpin_replica("f", 1, 3_000).unwrap();
+    assert!(store.files().unwrap()[0].replicas.is_empty());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

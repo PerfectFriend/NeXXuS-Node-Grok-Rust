@@ -289,15 +289,21 @@ impl Store {
 
     pub fn open(dir: &Path, identity: Identity, device_id: [u8; 16]) -> Result<Self, VaultError> {
         let packed = fs::read(dir.join("map.bin")).map_err(|_| err("нет map.bin"))?;
-        let journal = load_journal(&packed, &identity.vault_key)?;
+        let mut journal = load_journal(&packed, &identity.vault_key)?;
         let device = derive_device(&identity.seed, &device_id);
+        let before = journal["devices"].as_array().map(|items| items.len()).unwrap_or(0);
+        enroll(&mut journal, &identity, &device);
         fold_journal(&journal, &identity.ed_pub)?;
-        Ok(Self {
+        let store = Self {
             dir: dir.to_path_buf(),
             identity,
             device,
             journal,
-        })
+        };
+        if store.journal["devices"].as_array().map(|items| items.len()).unwrap_or(0) != before {
+            store.write_map()?;
+        }
+        Ok(store)
     }
 
     pub fn files(&self) -> Result<Vec<FileRec>, VaultError> {
@@ -359,6 +365,145 @@ impl Store {
         Ok(out)
     }
 
+    pub fn plan_replica(&self, id: &str, slot: u64) -> Result<Planned, VaultError> {
+        if slot == 0 || slot > 3 {
+            return Err(err("слот копии 1, 2 или 3"));
+        }
+        if self.files()?.iter().any(|file| file.id == id && file.replicas.iter().any(|replica| replica.slot == slot)) {
+            return Err(err("слот занят"));
+        }
+        let bytes = self.read_file(id)?;
+        let file = self.files()?.into_iter().find(|file| file.id == id).ok_or_else(|| err("Файл не найден."))?;
+        let key = decode32(&file.file_key)?;
+        let prefix = random16()?;
+        let mut cids = Vec::new();
+        let mut bodies = Vec::new();
+        let count = file.chunks.len();
+        for index in 0..count {
+            let start = index * CHUNK_BYTES;
+            let end = (start + CHUNK_BYTES).min(bytes.len());
+            let slice = if start >= bytes.len() { &[][..] } else { &bytes[start..end] };
+            let (cid, ct) = seal_chunk(&key, &pad_chunk(slice), &prefix, index as u32, slot as u32)?;
+            cids.push(cid);
+            bodies.push(ct);
+        }
+        Ok(Planned {
+            slot,
+            prefix: hex::encode(prefix),
+            cids,
+            bodies,
+        })
+    }
+
+    pub fn pin_replica(&mut self, id: &str, planned: &Planned, holder: &Holder, at: u64) -> Result<(), VaultError> {
+        let mut op = Map::new();
+        op.insert("op".into(), json!("pin"));
+        op.insert("id".into(), json!(id));
+        op.insert("slot".into(), json!(planned.slot));
+        op.insert("prefix".into(), json!(planned.prefix));
+        op.insert("cids".into(), json!(planned.cids));
+        op.insert("holder".into(), json!(holder.fingerprint));
+        op.insert("host".into(), json!(holder.host));
+        op.insert("port".into(), json!(holder.port));
+        op.insert("pubHex".into(), json!(holder.pub_hex));
+        op.insert("dev".into(), json!(hex::encode(self.device.ed_pub)));
+        op.insert("at".into(), json!(at));
+        self.push_op(sign_op(op, &self.device))
+    }
+
+    pub fn note_seen(&mut self, id: &str, slot: u64, at: u64) -> Result<bool, VaultError> {
+        let live = self.files()?.iter().any(|file| file.id == id && file.replicas.iter().any(|replica| replica.slot == slot));
+        if !live {
+            return Ok(false);
+        }
+        if let Some(ops) = self.journal["ops"].as_array_mut() {
+            ops.retain(|op| !(op["op"] == "seen" && op["id"] == id && op["slot"].as_u64() == Some(slot)));
+        }
+        let mut op = Map::new();
+        op.insert("op".into(), json!("seen"));
+        op.insert("id".into(), json!(id));
+        op.insert("slot".into(), json!(slot));
+        op.insert("dev".into(), json!(hex::encode(self.device.ed_pub)));
+        op.insert("at".into(), json!(at));
+        self.push_op(sign_op(op, &self.device))?;
+        Ok(true)
+    }
+
+    pub fn unpin_replica(&mut self, id: &str, slot: u64, at: u64) -> Result<bool, VaultError> {
+        let live = self.files()?.iter().any(|file| file.id == id && file.replicas.iter().any(|replica| replica.slot == slot));
+        if !live {
+            return Ok(false);
+        }
+        if let Some(ops) = self.journal["ops"].as_array_mut() {
+            ops.retain(|op| !(op["op"] == "seen" && op["id"] == id && op["slot"].as_u64() == Some(slot)));
+        }
+        let mut op = Map::new();
+        op.insert("op".into(), json!("unpin"));
+        op.insert("id".into(), json!(id));
+        op.insert("slot".into(), json!(slot));
+        op.insert("dev".into(), json!(hex::encode(self.device.ed_pub)));
+        op.insert("at".into(), json!(at));
+        self.push_op(sign_op(op, &self.device))?;
+        Ok(true)
+    }
+
+    pub fn stale_replicas(&self, grace_ms: u64, now: u64) -> Result<Vec<(String, u64, String)>, VaultError> {
+        let mut stale = Vec::new();
+        for file in self.files()? {
+            for replica in file.replicas {
+                if now.saturating_sub(replica.seen) <= grace_ms {
+                    continue;
+                }
+                stale.push((file.id.clone(), replica.slot, replica.holder));
+            }
+        }
+        Ok(stale)
+    }
+
+    pub fn proof_for(&self, id: &str, slot: u64, index: usize, challenge: &[u8]) -> Result<String, VaultError> {
+        let bytes = self.read_file(id)?;
+        let file = self.files()?.into_iter().find(|file| file.id == id).ok_or_else(|| err("Файл не найден."))?;
+        let replica = file.replicas.iter().find(|item| item.slot == slot).ok_or_else(|| err("копия уже снята"))?;
+        let key = decode32(&file.file_key)?;
+        let prefix = hex::decode(&replica.prefix).map_err(|_| err("префикс"))?;
+        let start = index * CHUNK_BYTES;
+        let end = (start + CHUNK_BYTES).min(bytes.len());
+        let slice = if start >= bytes.len() { &[][..] } else { &bytes[start..end] };
+        let (cid, ct) = seal_chunk(&key, &pad_chunk(slice), &prefix, index as u32, slot as u32)?;
+        if replica.cids.get(index) != Some(&cid) {
+            return Err(err("идентификатор копии разъехался"));
+        }
+        Ok(audit_proof(&ct, challenge))
+    }
+
+    pub fn store_foreign(&self, cid: &str, ct: &[u8]) -> Result<bool, VaultError> {
+        if ct.len() != CHUNK_BYTES + 16 || hex::encode(Sha256::digest(ct)) != cid {
+            return Ok(false);
+        }
+        let root = self.dir.join("blobs-net");
+        let path = blob_path(&root, cid);
+        if path.is_file() {
+            return Ok(true);
+        }
+        if foreign_bytes(&root)? + ct.len() as u64 > 64 * 1024 * 1024 {
+            return Ok(false);
+        }
+        write_blob(&root, cid, ct)?;
+        Ok(true)
+    }
+
+    pub fn foreign_cipher(&self, cid: &str) -> Option<Vec<u8>> {
+        if cid.len() != 64 || !cid.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let path = blob_path(&self.dir.join("blobs-net"), cid);
+        let ct = fs::read(path).ok()?;
+        if hex::encode(Sha256::digest(&ct)) != cid {
+            return None;
+        }
+        Some(ct)
+    }
+
     fn push_op(&mut self, op: Value) -> Result<(), VaultError> {
         self.journal["ops"].as_array_mut().ok_or_else(|| err("журнал"))?.push(op);
         fold_journal(&self.journal, &self.identity.ed_pub)?;
@@ -385,6 +530,38 @@ fn enroll(journal: &mut Value, identity: &Identity, device: &Device) {
         .as_array_mut()
         .expect("devices")
         .push(json!({"pub": pub_hex, "cert": cert}));
+}
+
+pub struct Planned {
+    pub slot: u64,
+    pub prefix: String,
+    pub cids: Vec<String>,
+    pub bodies: Vec<Vec<u8>>,
+}
+
+pub struct Holder {
+    pub fingerprint: String,
+    pub host: String,
+    pub port: u64,
+    pub pub_hex: String,
+}
+
+fn foreign_bytes(root: &Path) -> Result<u64, VaultError> {
+    let mut total = 0u64;
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    for shard in fs::read_dir(root).map_err(|e| err(&e.to_string()))? {
+        let shard = shard.map_err(|e| err(&e.to_string()))?;
+        if !shard.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        for file in fs::read_dir(shard.path()).map_err(|e| err(&e.to_string()))? {
+            let file = file.map_err(|e| err(&e.to_string()))?;
+            total += file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+    Ok(total)
 }
 
 fn write_blob(root: &Path, cid: &str, ct: &[u8]) -> Result<(), VaultError> {

@@ -1,0 +1,15 @@
+[package]
+name = "nexxus-node"
+version = "0.1.0"
+edition = "2021"
+description = "Lab node: vault plus replica placement, audit and grace."
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+hex = "0.4"
+getrandom = "0.2"
+nexxus-crypto = { path = "../nexxus-crypto" }
+nexxus-net = { path = "../nexxus-net" }
+nexxus-vault = { path = "../nexxus-vault" }
+serde_json = "1"

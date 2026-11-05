@@ -22,6 +22,8 @@ struct PeerOut {
     tx: std::sync::mpsc::Sender<String>,
 }
 
+pub type PacketHandler = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 struct Inner {
     identity: Identity,
     name: String,
@@ -31,6 +33,7 @@ struct Inner {
     peers: Mutex<HashMap<String, PeerOut>>,
     inbox: Mutex<Vec<ChatLine>>,
     ready: Condvar,
+    on_packet: Mutex<Option<PacketHandler>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +55,7 @@ impl Mesh {
                 peers: Mutex::new(HashMap::new()),
                 inbox: Mutex::new(Vec::new()),
                 ready: Condvar::new(),
+                on_packet: Mutex::new(None),
             }),
         };
         let background = mesh.clone();
@@ -90,6 +94,24 @@ impl Mesh {
             "ts": now_ms(),
         });
         peer.tx.send(line.to_string()).map_err(|_| "канал закрыт".to_string())
+    }
+
+    pub fn send_json(&self, fingerprint: &str, body: &serde_json::Value) -> Result<(), String> {
+        let peers = self.inner.peers.lock().map_err(|_| "замок".to_string())?;
+        let peer = peers.get(fingerprint).ok_or("контакт ещё не в сети")?;
+        peer.tx.send(body.to_string()).map_err(|_| "канал закрыт".to_string())
+    }
+
+    pub fn set_handler(&self, handler: PacketHandler) {
+        *self.inner.on_packet.lock().expect("handler") = Some(handler);
+    }
+
+    pub fn peers(&self) -> Vec<String> {
+        self.inner
+            .peers
+            .lock()
+            .map(|peers| peers.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn wait_chat(&self, text: &str, timeout: Duration) -> bool {
@@ -232,6 +254,9 @@ impl Mesh {
                     });
                     self.inner.ready.notify_all();
                 }
+            }
+            if let Some(handler) = self.inner.on_packet.lock().ok().and_then(|guard| guard.clone()) {
+                handler(&remote.fingerprint, obj);
             }
         }
         Ok(())

@@ -8,3 +8,4 @@ license = "MIT"
 [dependencies]
 nexxus-crypto = { path = "../nexxus-crypto" }
 nexxus-node = { path = "../nexxus-node" }
+nexxus-tor = { path = "../nexxus-tor" }

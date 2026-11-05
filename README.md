@@ -1,6 +1,6 @@
 # NeXXuS-Node-Grok-Rust
 
-Нода NeXXXUs на Rust. С Linux 0.10.0 сходятся ключи, HELLO v3, лабораторный чат, `identity.bin`, журнал `map.bin`, раскладка копии и проверка чанка. Льгота снимает молчащую копию локально. Tor ещё нет.
+Нода NeXXXUs на Rust. С Linux 0.10.0 сходятся ключи, HELLO v3, лабораторный чат, `identity.bin`, журнал `map.bin`, копия, проверка чанка и профиль `onion`: бинарник `tor`, адрес только из `hostname`, звонок через SOCKS5. Свой onion не выдумывается. Живой прогон через сеть Tor в обычный тест не входит.
 
 Эталон — [NeXXXUs-Grok](https://github.com/PerfectFriend/NeXXXUs-Grok). Этот репозиторий его не заменяет.
 

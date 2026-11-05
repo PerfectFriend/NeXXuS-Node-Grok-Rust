@@ -1,0 +1,9 @@
+[package]
+name = "nexxus-tor"
+version = "0.1.0"
+edition = "2021"
+description = "Write torrc and wait for the hostname file. Does not invent an onion address."
+license = "MIT"
+
+[dependencies]
+nexxus-crypto = { path = "../nexxus-crypto" }

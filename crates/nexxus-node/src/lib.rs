@@ -32,7 +32,21 @@ pub struct Node {
 
 impl Node {
     pub fn start(dir: &std::path::Path, identity: Identity, device_id: [u8; 16], name: &str, port: u16) -> std::io::Result<Self> {
-        let mesh = Mesh::listen(identity.clone(), name, "127.0.0.1", port)?;
+        Self::start_with(dir, identity, device_id, name, port, "127.0.0.1", "lab", None)
+    }
+
+    pub fn start_with(
+        dir: &std::path::Path,
+        identity: Identity,
+        device_id: [u8; 16],
+        name: &str,
+        port: u16,
+        advertise: &str,
+        profile: &str,
+        socks: Option<(&str, u16)>,
+    ) -> std::io::Result<Self> {
+        let mesh = Mesh::listen(identity.clone(), name, advertise, port)?;
+        mesh.set_route(profile, socks).map_err(|e| std::io::Error::other(e))?;
         let store = if dir.join("map.bin").is_file() {
             Store::open(dir, identity, device_id)
         } else {

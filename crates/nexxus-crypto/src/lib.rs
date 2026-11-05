@@ -38,6 +38,17 @@ pub fn create_mnemonic() -> Result<String, CryptoError> {
     Ok(mnemonic.to_string())
 }
 
+pub fn is_onion(host: &str) -> bool {
+    let Some((name, suffix)) = host.trim().rsplit_once('.') else {
+        return false;
+    };
+    suffix.eq_ignore_ascii_case("onion")
+        && name.len() == 56
+        && name
+            .bytes()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'a'..=b'z' | b'2'..=b'7'))
+}
+
 pub fn fingerprint_from_pub(public: &[u8]) -> String {
     let digest = Sha256::digest(public);
     format!("nxx1{}", hex::encode(&digest[..8]))

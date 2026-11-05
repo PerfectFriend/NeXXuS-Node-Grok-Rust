@@ -291,6 +291,7 @@ version = "0.1.0"
 dependencies = [
  "nexxus-crypto",
  "nexxus-node",
+ "nexxus-tor",
 ]
 
 [[package]]
@@ -329,6 +330,13 @@ dependencies = [
  "nexxus-net",
  "nexxus-vault",
  "serde_json",
+]
+
+[[package]]
+name = "nexxus-tor"
+version = "0.1.0"
+dependencies = [
+ "nexxus-crypto",
 ]
 
 [[package]]

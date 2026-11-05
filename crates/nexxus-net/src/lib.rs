@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nexxus_crypto::{
-    derive_session_key, format_contact, open_packed, parse_contact, seal_packed, Contact, Hello, Identity,
+    derive_session_key, format_contact, is_onion, open_packed, parse_contact, seal_packed, Contact, Hello, Identity,
 };
 
 #[derive(Clone, Debug)]
@@ -34,6 +34,9 @@ struct Inner {
     inbox: Mutex<Vec<ChatLine>>,
     ready: Condvar,
     on_packet: Mutex<Option<PacketHandler>>,
+    profile: Mutex<String>,
+    socks_host: Mutex<String>,
+    socks_port: Mutex<u16>,
 }
 
 #[derive(Clone)]
@@ -56,6 +59,9 @@ impl Mesh {
                 inbox: Mutex::new(Vec::new()),
                 ready: Condvar::new(),
                 on_packet: Mutex::new(None),
+                profile: Mutex::new("lab".into()),
+                socks_host: Mutex::new(String::new()),
+                socks_port: Mutex::new(0),
             }),
         };
         let background = mesh.clone();
@@ -76,10 +82,42 @@ impl Mesh {
         })
     }
 
+    pub fn set_route(&self, profile: &str, socks: Option<(&str, u16)>) -> Result<(), String> {
+        if profile != "lab" && profile != "onion" {
+            return Err("Профиль только lab или onion.".into());
+        }
+        if profile == "onion" && socks.map(|(_, port)| port == 0).unwrap_or(true) {
+            return Err("Не задан Tor SOCKS.".into());
+        }
+        *self.inner.profile.lock().map_err(|_| "замок")? = profile.to_string();
+        if let Some((host, port)) = socks {
+            *self.inner.socks_host.lock().map_err(|_| "замок")? = host.to_string();
+            *self.inner.socks_port.lock().map_err(|_| "замок")? = port;
+        }
+        Ok(())
+    }
+
     pub fn dial(&self, uri: &str) -> Result<(), String> {
         let contact = parse_contact(uri).map_err(|e| e.0)?;
-        let address = format!("{}:{}", contact.host, contact.port);
-        let stream = TcpStream::connect(&address).map_err(|e| e.to_string())?;
+        let onion = is_onion(&contact.host);
+        let profile = self.inner.profile.lock().map_err(|_| "замок")?.clone();
+        if profile == "onion" && !onion {
+            return Err("В луковом профиле контакт обязан быть v3 .onion.".into());
+        }
+        if profile != "onion" && onion {
+            return Err("Луковый контакт нельзя звать из лабораторного TCP. Нужен --profile onion.".into());
+        }
+        let stream = if profile == "onion" {
+            let host = self.inner.socks_host.lock().map_err(|_| "замок")?.clone();
+            let port = *self.inner.socks_port.lock().map_err(|_| "замок")?;
+            if host.is_empty() || port == 0 {
+                return Err("Не задан Tor SOCKS.".into());
+            }
+            connect_via_socks(&host, port, &contact.host, contact.port)?
+        } else {
+            let address = format!("{}:{}", contact.host, contact.port);
+            TcpStream::connect(&address).map_err(|e| e.to_string())?
+        };
         self.spawn_link(stream, false, Some(contact));
         Ok(())
     }
@@ -159,9 +197,12 @@ impl Mesh {
     }
 
     fn run_link(&self, mut stream: TcpStream, inbound: bool, expected: Option<Contact>) -> Result<(), String> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(12)))
-            .map_err(|e| e.to_string())?;
+        let hello_wait = if self.inner.profile.lock().map(|profile| profile.as_str() == "onion").unwrap_or(false) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(12)
+        };
+        stream.set_read_timeout(Some(hello_wait)).map_err(|e| e.to_string())?;
         let (eph_priv, eph_pub) = nexxus_crypto::ephemeral().map_err(|e| e.0)?;
         let hello = Hello::sign(
             &self.inner.identity,
@@ -293,6 +334,47 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn connect_via_socks(socks_host: &str, socks_port: u16, host: &str, port: u16) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(format!("{socks_host}:{socks_port}")).map_err(|e| format!("SOCKS {host}:{port} — {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    stream.write_all(&[5, 1, 0]).map_err(|e| e.to_string())?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).map_err(|e| format!("SOCKS {host}:{port} — {e}"))?;
+    if greeting != [5, 0] {
+        return Err("SOCKS не принял соединение без пароля.".into());
+    }
+    let name = host.as_bytes();
+    if name.is_empty() || name.len() > 255 {
+        return Err("Адрес для SOCKS пустой или слишком длинный.".into());
+    }
+    let mut req = vec![5, 1, 0, 3, name.len() as u8];
+    req.extend_from_slice(name);
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).map_err(|e| e.to_string())?;
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).map_err(|e| format!("SOCKS {host}:{port} — {e}"))?;
+    if head[0] != 5 {
+        return Err("SOCKS вернул неизвестный тип адреса.".into());
+    }
+    let extra = match head[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).map_err(|e| e.to_string())?;
+            usize::from(len[0]) + 2
+        }
+        _ => return Err("SOCKS вернул неизвестный тип адреса.".into()),
+    };
+    let mut rest = vec![0u8; extra];
+    stream.read_exact(&mut rest).map_err(|e| e.to_string())?;
+    if head[1] != 0 {
+        return Err(format!("SOCKS отказал в соединении, код {}.", head[1]));
+    }
+    stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+    Ok(stream)
 }
 
 fn write_frame(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {

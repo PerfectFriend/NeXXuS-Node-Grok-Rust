@@ -28,6 +28,7 @@ struct Inner {
     identity: Identity,
     name: String,
     advertise: String,
+    bind: String,
     port: u16,
     stop: std::sync::atomic::AtomicBool,
     peers: Mutex<HashMap<String, PeerOut>>,
@@ -46,13 +47,18 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn listen(identity: Identity, name: &str, advertise: &str, port: u16) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        Self::listen_on("127.0.0.1", identity, name, advertise, port)
+    }
+
+    pub fn listen_on(bind_host: &str, identity: Identity, name: &str, advertise: &str, port: u16) -> std::io::Result<Self> {
+        let listener = TcpListener::bind((bind_host, port))?;
         let port = listener.local_addr()?.port();
         let mesh = Self {
             inner: Arc::new(Inner {
                 identity,
                 name: name.to_string(),
                 advertise: advertise.to_string(),
+                bind: bind_host.to_string(),
                 port,
                 stop: std::sync::atomic::AtomicBool::new(false),
                 peers: Mutex::new(HashMap::new()),
@@ -150,6 +156,10 @@ impl Mesh {
             .lock()
             .map(|peers| peers.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn chats(&self) -> Vec<ChatLine> {
+        self.inner.inbox.lock().map(|inbox| inbox.clone()).unwrap_or_default()
     }
 
     pub fn wait_chat(&self, text: &str, timeout: Duration) -> bool {
@@ -307,7 +317,12 @@ impl Mesh {
 impl Drop for Mesh {
     fn drop(&mut self) {
         self.inner.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = TcpStream::connect(("127.0.0.1", self.inner.port));
+        let host = if self.inner.bind == "0.0.0.0" || self.inner.bind == "::" {
+            "127.0.0.1"
+        } else {
+            &self.inner.bind
+        };
+        let _ = TcpStream::connect((host, self.inner.port));
     }
 }
 

@@ -10,6 +10,8 @@ fn main() {
     match args.next().as_deref() {
         None | Some("help") | Some("--help") | Some("-h") => print_help(),
         Some("start") => start(args.collect()),
+        Some("ctl") => ctl(args.collect()),
+        Some("version") => println!("nexxus 0.2.0-lab"),
         Some(other) => {
             eprintln!("неизвестная команда: {other}");
             std::process::exit(2);
@@ -19,12 +21,18 @@ fn main() {
 
 fn print_help() {
     println!(
-        "NeXXXUs Rust 0.1.0\n\n\
-         nexxus start [--data DIR] [--port N] [--name NAME] [--mnemonic \"12 слов\"] [--contact URI]\n\
-         [--profile lab|onion] [--tor-bin PATH] [--tor-socks ХОСТ:ПОРТ] [--advertise ХОСТ]\n\n\
-         Лабораторный TCP на 127.0.0.1. Сейф map.bin, до трёх копий, проверка чанка.\n\
-         Профиль onion запускает бинарник tor и берёт адрес только из его hostname.\n\
-         Нет бинарника и нет готового v3 — старт с ошибкой. Адрес не выдумывается."
+        "NeXXXUs Rust 0.2.0-lab\n\n\
+         nexxus start [--data DIR] [--port N] [--listen ADDR] [--name NAME]\n\
+         [--mnemonic \"12 слов\"] [--contact URI] [--advertise ХОСТ]\n\
+         [--profile lab|onion] [--tor-bin PATH] [--tor-socks ХОСТ:ПОРТ]\n\n\
+         nexxus ctl --data DIR status|files|chats|peers\n\
+         nexxus ctl --data DIR dial 'nexxus:1:…'\n\
+         nexxus ctl --data DIR put ФАЙЛ\n\
+         nexxus ctl --data DIR chat ОТПЕЧАТОК текст\n\n\
+         Лабораторный профиль слушает 0.0.0.0 и публикует адрес этой машины.\n\
+         Команды ctl принимаются только с 127.0.0.1.\n\
+         Профиль onion запускает бинарник tor и берёт адрес только из hostname.\n\
+         Очереди SMP, описания XFTP и панели в этом пакете нет."
     );
 }
 
@@ -38,6 +46,7 @@ fn start(args: Vec<String>) {
     let mut tor_bin = "tor".to_string();
     let mut tor_socks = None;
     let mut advertise = None;
+    let mut listen = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -75,6 +84,10 @@ fn start(args: Vec<String>) {
             }
             "--advertise" => {
                 advertise = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--listen" => {
+                listen = args.get(i + 1).cloned();
                 i += 2;
             }
             other => {
@@ -120,20 +133,48 @@ fn start(args: Vec<String>) {
             eprintln!("Лабораторный профиль не публикует .onion. Запустите с --profile onion.");
             std::process::exit(1);
         }
-        (advertise.unwrap_or_else(|| "127.0.0.1".into()), None)
+        (advertise.unwrap_or_else(|| lan_ipv4().unwrap_or_else(|| "127.0.0.1".into())), None)
     } else {
         eprintln!("Профиль только lab или onion.");
         std::process::exit(2);
     };
+    let bind = if profile == "onion" {
+        "127.0.0.1".to_string()
+    } else {
+        listen.unwrap_or_else(|| "0.0.0.0".into())
+    };
     let socks_ref = socks.as_ref().map(|(host, port)| (host.as_str(), *port));
-    let node = Node::start_with(&data, account.identity, account.device_id, &name, port, &advertise_host, &profile, socks_ref).unwrap_or_else(|e| {
+    let node = Node::start_with(
+        &data,
+        account.identity,
+        account.device_id,
+        &name,
+        port,
+        &bind,
+        &advertise_host,
+        &profile,
+        socks_ref,
+    )
+    .unwrap_or_else(|e| {
         eprintln!("не поднялась: {e}");
         std::process::exit(1);
     });
+    let control = node.serve_control(port.saturating_add(1)).or_else(|_| node.serve_control(0)).unwrap_or_else(|e| {
+        eprintln!("управляющий порт: {e}");
+        std::process::exit(1);
+    });
+    let _ = std::fs::write(data.join("control.port"), control.to_string());
+    let _ = std::fs::write(data.join("contact.txt"), format!("{}\n", node.contact()));
     let _hold_tor = tor_guard;
-    println!("Каталог: {}", data.display());
-    println!("Контакт: {}", node.contact());
-    println!("Файлов в сейфе: {}. Слушаю 127.0.0.1:{port}.", node.file_ids().len());
+    let banner = format!(
+        "Каталог: {}\nКонтакт: {}\nФайлов в сейфе: {}. Слушаю {bind}:{}.\nУправление: 127.0.0.1:{control}",
+        data.display(),
+        node.contact(),
+        node.file_ids().len(),
+        contact_port(&node.contact())
+    );
+    println!("{banner}");
+    append_log(&data, &banner);
     if let Some(uri) = contact {
         if let Err(err) = node.dial(&uri) {
             eprintln!("не дозвонились: {err}");
@@ -160,6 +201,73 @@ fn start(args: Vec<String>) {
             eprintln!("льгота: {err}");
         }
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn ctl(args: Vec<String>) {
+    let mut data = default_data();
+    let mut i = 0;
+    let mut rest = Vec::new();
+    while i < args.len() {
+        if args[i] == "--data" {
+            data = PathBuf::from(args.get(i + 1).cloned().unwrap_or_default());
+            i += 2;
+        } else {
+            rest.push(args[i].clone());
+            i += 1;
+        }
+    }
+    if rest.is_empty() {
+        eprintln!("нужна команда: status, files, chats, dial, put, chat");
+        std::process::exit(2);
+    }
+    let port_text = std::fs::read_to_string(data.join("control.port")).unwrap_or_else(|_| {
+        eprintln!("нода не запущена: нет control.port в {}", data.display());
+        std::process::exit(1);
+    });
+    let port: u16 = port_text.trim().parse().unwrap_or_else(|_| {
+        eprintln!("битый control.port");
+        std::process::exit(1);
+    });
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|err| {
+        eprintln!("нет связи с нодой на 127.0.0.1:{port}: {err}");
+        std::process::exit(1);
+    });
+    let line = rest.join(" ");
+    use std::io::{Read, Write};
+    let _ = stream.write_all(line.as_bytes());
+    let _ = stream.write_all(b"\n");
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    print!("{buf}");
+    if !buf.ends_with('\n') {
+        println!();
+    }
+    append_log(&data, &format!("ctl {line} -> {}", buf.trim()));
+    if buf.starts_with("err") {
+        std::process::exit(1);
+    }
+}
+
+fn contact_port(contact: &str) -> String {
+    contact.rsplit(':').next().unwrap_or("?").to_string()
+}
+
+fn lan_ipv4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+fn append_log(dir: &std::path::Path, text: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("node.log")) {
+        let _ = writeln!(file, "{text}");
     }
 }
 

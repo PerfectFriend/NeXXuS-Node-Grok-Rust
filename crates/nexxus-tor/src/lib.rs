@@ -4,7 +4,6 @@
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -46,7 +45,7 @@ pub fn start_tor(bin: &str, root: &Path, listen_port: u16, timeout: Duration) ->
     let hs_dir = root.join("hs");
     fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&hs_dir).map_err(|e| e.to_string())?;
-    fs::set_permissions(&hs_dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    restrict_dir(&hs_dir)?;
     let socks_port = free_port()?;
     let torrc = root.join("torrc");
     fs::write(&torrc, render_torrc(&data_dir, socks_port, &hs_dir, listen_port)).map_err(|e| e.to_string())?;
@@ -98,6 +97,17 @@ pub fn start_tor(bin: &str, root: &Path, listen_port: u16, timeout: Duration) ->
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn free_port() -> Result<u16, String> {

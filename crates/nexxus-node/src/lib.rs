@@ -6,6 +6,8 @@ mod account;
 pub use account::{load_account, Account};
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +34,7 @@ pub struct Node {
 
 impl Node {
     pub fn start(dir: &std::path::Path, identity: Identity, device_id: [u8; 16], name: &str, port: u16) -> std::io::Result<Self> {
-        Self::start_with(dir, identity, device_id, name, port, "127.0.0.1", "lab", None)
+        Self::start_with(dir, identity, device_id, name, port, "127.0.0.1", "127.0.0.1", "lab", None)
     }
 
     pub fn start_with(
@@ -41,11 +43,12 @@ impl Node {
         device_id: [u8; 16],
         name: &str,
         port: u16,
+        bind_host: &str,
         advertise: &str,
         profile: &str,
         socks: Option<(&str, u16)>,
     ) -> std::io::Result<Self> {
-        let mesh = Mesh::listen(identity.clone(), name, advertise, port)?;
+        let mesh = Mesh::listen_on(bind_host, identity.clone(), name, advertise, port)?;
         mesh.set_route(profile, socks).map_err(|e| std::io::Error::other(e))?;
         let store = if dir.join("map.bin").is_file() {
             Store::open(dir, identity, device_id)
@@ -94,6 +97,97 @@ impl Node {
             .and_then(|store| store.files().ok())
             .map(|files| files.into_iter().map(|file| file.id).collect())
             .unwrap_or_default()
+    }
+
+    pub fn chats(&self) -> Vec<(String, String)> {
+        self.core.mesh.chats().into_iter().map(|line| (line.from, line.text)).collect()
+    }
+
+    pub fn command(&self, line: &str) -> String {
+        let line = line.trim();
+        let (verb, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim();
+        match verb {
+            "status" | "" => {
+                let peers = self.core.mesh.peers().join(",");
+                format!(
+                    "ok contact={} files={} peers={}",
+                    self.contact(),
+                    self.file_ids().len(),
+                    if peers.is_empty() { "-".into() } else { peers }
+                )
+            }
+            "contact" => self.contact(),
+            "peers" => {
+                let peers = self.core.mesh.peers();
+                if peers.is_empty() { "ok -".into() } else { format!("ok {}", peers.join(" ")) }
+            }
+            "files" => {
+                let lines: Vec<String> = self
+                    .file_ids()
+                    .into_iter()
+                    .map(|id| format!("{id} copies={}", self.copies(&id)))
+                    .collect();
+                if lines.is_empty() { "ok -".into() } else { format!("ok {}", lines.join(" | ")) }
+            }
+            "chats" => {
+                let lines: Vec<String> = self.chats().into_iter().map(|(from, text)| format!("{from} {text}")).collect();
+                if lines.is_empty() { "ok -".into() } else { format!("ok {}", lines.join(" | ")) }
+            }
+            "dial" => match self.dial(rest) {
+                Ok(()) => "ok dial".into(),
+                Err(err) => format!("err {err}"),
+            },
+            "put" => self.cmd_put(rest),
+            "chat" => {
+                let Some((fp, text)) = rest.split_once(char::is_whitespace) else {
+                    return "err нужно: chat ОТПЕЧАТОК текст".into();
+                };
+                match self.send_chat(fp, text.trim()) {
+                    Ok(()) => "ok chat".into(),
+                    Err(err) => format!("err {err}"),
+                }
+            }
+            _ => "err команда: status, contact, peers, files, chats, dial, put, chat".into(),
+        }
+    }
+
+    pub fn serve_control(&self, port: u16) -> std::io::Result<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        let bound = listener.local_addr()?.port();
+        let node = self.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(stream) = conn else { continue };
+                let node = node.clone();
+                std::thread::spawn(move || {
+                    let _ = answer_control(&node, stream);
+                });
+            }
+        });
+        Ok(bound)
+    }
+
+    fn cmd_put(&self, path: &str) -> String {
+        if path.is_empty() {
+            return "err нужно: put ПУТЬ".into();
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => return format!("err {err}"),
+        };
+        if bytes.len() > 64 * 1024 * 1024 {
+            return "err файл больше 64 МБ".into();
+        }
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file.bin");
+        let id = format!("{}-{}", sanitize(name), now_ms());
+        match self.add_file(&id, name, &bytes) {
+            Ok(()) => format!("ok {id}"),
+            Err(err) => format!("err {err}"),
+        }
     }
 
     pub fn dial(&self, uri: &str) -> Result<(), String> {
@@ -276,6 +370,27 @@ impl Node {
             _ => {}
         }
     }
+}
+
+fn answer_control(node: &Node, stream: TcpStream) -> std::io::Result<()> {
+    let mut stream = stream;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let answer = node.command(&line);
+    stream.write_all(answer.as_bytes())?;
+    stream.write_all(b"\n")?;
+    Ok(())
+}
+
+fn sanitize(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' { ch } else { '-' })
+        .take(40)
+        .collect();
+    if clean.is_empty() { "file".into() } else { clean }
 }
 
 fn b64(bytes: &[u8]) -> String {

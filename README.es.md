@@ -43,18 +43,23 @@ Compilación **0.2.0-lab**. Coincide con Linux 0.10.0 en:
 - el diario `map.bin` y los trozos de 16 KiB: Linux abre un diario de Rust, Rust abre un archivo guardado por Linux;
 - una copia en otro nodo y la prueba de que el cifrado sigue ahí;
 - el plazo de gracia y la multa local;
-- el perfil `onion`: arranca un binario `tor` de verdad, toma la dirección solo del `hostname` que ese proceso escribió y llama a través de SOCKS5. No se inventa una dirección onion. Si no hay binario `tor`, el arranque falla.
+- el perfil `onion`: arranca un binario `tor` de verdad, toma la dirección solo del `hostname` que ese proceso escribió y llama a través de SOCKS5. No se inventa una dirección onion. Si no hay binario `tor`, el arranque falla;
+- una cola `nexxus-smp-v1`: el relé guarda cifrado y lo devuelve solo a quien abrió la cola;
+- una descripción `nexxus-xftp-v1` sin direcciones de nodos;
+- `--miner`: los archivos propios no entran en las copias gratuitas;
+- la carpeta `drive`, copia abierta de la caja, no un volumen oculto.
 
 El perfil de laboratorio escucha en `0.0.0.0` y publica la dirección de la máquina, para que dos ordenadores de la misma red puedan encontrarse. Las órdenes de control solo se aceptan desde la propia máquina, en `127.0.0.1`.
+
+El plan de estas partes y de lo que sigue abierto: [docs/PLAN.md](docs/PLAN.md).
 
 ## Lo que esta compilación no trae
 
 No está prometido y no está incluido:
 
-- una cola SMP y una descripción de archivo XFTP;
-- la carpeta `drive` y un panel web;
-- el anuncio de un minero y cualquier pago;
+- el pago y la comprobación de 16 GiB libres;
 - una prueba en vivo de dos onion reales a través de la red Tor dentro de los tests ordinarios;
+- un panel web;
 - Android y un cliente para Apple.
 
 Hasta que eso exista, este repositorio es un nodo de ensayo, no una tienda de aplicaciones ni una bolsa.

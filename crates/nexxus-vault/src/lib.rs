@@ -341,6 +341,15 @@ impl Store {
         self.files()?.into_iter().find(|file| file.id == id).ok_or_else(|| err("файл не записан"))
     }
 
+    pub fn drop_file(&mut self, id: &str) -> Result<(), VaultError> {
+        let mut op = Map::new();
+        op.insert("op".into(), json!("drop"));
+        op.insert("id".into(), json!(id));
+        op.insert("dev".into(), json!(hex::encode(self.device.ed_pub)));
+        op.insert("at".into(), json!(now_ms()));
+        self.push_op(sign_op(op, &self.device))
+    }
+
     pub fn read_file(&self, id: &str) -> Result<Vec<u8>, VaultError> {
         let file = self.files()?.into_iter().find(|file| file.id == id).ok_or_else(|| err("Файл не найден."))?;
         let key = decode32(&file.file_key)?;

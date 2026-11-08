@@ -24,15 +24,17 @@ fn print_help() {
         "NeXXXUs Rust 0.2.0-lab\n\n\
          nexxus start [--data DIR] [--port N] [--listen ADDR] [--name NAME]\n\
          [--mnemonic \"12 слов\"] [--contact URI] [--advertise ХОСТ]\n\
-         [--profile lab|onion] [--tor-bin PATH] [--tor-socks ХОСТ:ПОРТ]\n\n\
-         nexxus ctl --data DIR status|files|chats|peers\n\
+         [--profile lab|onion] [--tor-bin PATH] [--tor-socks ХОСТ:ПОРТ] [--miner]\n\n\
+         nexxus ctl --data DIR status|files|chats|peers|sync\n\
          nexxus ctl --data DIR dial 'nexxus:1:…'\n\
          nexxus ctl --data DIR put ФАЙЛ\n\
          nexxus ctl --data DIR chat ОТПЕЧАТОК текст\n\n\
          Лабораторный профиль слушает 0.0.0.0 и публикует адрес этой машины.\n\
          Команды ctl принимаются только с 127.0.0.1.\n\
+         --miner не кладёт свои файлы в бесплатные копии.\n\
+         Каталог drive внутри данных — открытая копия сейфа, не тайник.\n\
          Профиль onion запускает бинарник tor и берёт адрес только из hostname.\n\
-         Очереди SMP, описания XFTP и панели в этом пакете нет."
+         Оплаты в этом пакете нет."
     );
 }
 
@@ -47,6 +49,7 @@ fn start(args: Vec<String>) {
     let mut tor_socks = None;
     let mut advertise = None;
     let mut listen = None;
+    let mut miner = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -89,6 +92,10 @@ fn start(args: Vec<String>) {
             "--listen" => {
                 listen = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--miner" => {
+                miner = true;
+                i += 1;
             }
             other => {
                 eprintln!("неизвестный аргумент: {other}");
@@ -166,6 +173,9 @@ fn start(args: Vec<String>) {
     let _ = std::fs::write(data.join("control.port"), control.to_string());
     let _ = std::fs::write(data.join("contact.txt"), format!("{}\n", node.contact()));
     let _hold_tor = tor_guard;
+    if miner {
+        node.enable_miner();
+    }
     let banner = format!(
         "Каталог: {}\nКонтакт: {}\nФайлов в сейфе: {}. Слушаю {bind}:{}.\nУправление: 127.0.0.1:{control}",
         data.display(),

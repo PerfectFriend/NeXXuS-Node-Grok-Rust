@@ -12,4 +12,10 @@ getrandom = "0.2"
 nexxus-crypto = { path = "../nexxus-crypto" }
 nexxus-net = { path = "../nexxus-net" }
 nexxus-vault = { path = "../nexxus-vault" }
+nexxus-wire = { path = "../nexxus-wire" }
 serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+hex = "0.4"
+

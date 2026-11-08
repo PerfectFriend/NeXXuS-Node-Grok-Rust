@@ -43,18 +43,23 @@ Build **0.2.0-lab**. It matches Linux 0.10.0 on:
 - the `map.bin` journal and 16 KiB pieces: Linux opens a Rust journal, Rust opens a file stored by Linux;
 - one copy on another node, and a check that the ciphertext is still there;
 - the grace period and the local penalty;
-- the `onion` profile: it runs a real `tor` binary, takes the address only from that process's `hostname`, and dials through SOCKS5. It does not invent an onion address. No `tor` binary means the start fails.
+- the `onion` profile: it runs a real `tor` binary, takes the address only from that process's `hostname`, and dials through SOCKS5. It does not invent an onion address. No `tor` binary means the start fails;
+- an `nexxus-smp-v1` queue: the relay stores ciphertext and returns it only to the fingerprint that opened it;
+- an `nexxus-xftp-v1` description with no node addresses;
+- `--miner`: the node's own files are not placed into the free copies;
+- the `drive` folder, a plaintext copy of the vault, not a hidden volume.
 
 The lab profile listens on `0.0.0.0` and publishes this machine's address, so two computers on one network can meet. Control commands are accepted only from the same machine, on `127.0.0.1`.
+
+The plan for these parts, and for what is still open: [docs/PLAN.md](docs/PLAN.md).
 
 ## What this build does not contain
 
 Not promised and not included:
 
-- an SMP queue and an XFTP file description;
-- the `drive` folder and a web panel;
-- a miner announcement and any payment;
+- payment, and a check of 16 GiB free;
 - a live run of two real onion addresses through the Tor network inside the ordinary test suite;
+- a web panel;
 - Android, and an Apple client.
 
 Until those exist, this repository is a node for trials, not an app store and not an exchange.

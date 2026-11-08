@@ -15,6 +15,8 @@ use base64::Engine;
 use nexxus_crypto::{parse_contact, Identity};
 use nexxus_net::Mesh;
 use nexxus_vault::{audit_proof, Holder, Store};
+use nexxus_wire::{create_queue_key, open_queue, pack_xftp, sign_miner, unpack_xftp, verify_desc, verify_miner, Sealed};
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
 const PENALTY_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -25,6 +27,26 @@ struct Core {
     acks: Mutex<HashMap<String, mpsc::Sender<bool>>>,
     audits: Mutex<HashMap<String, mpsc::Sender<String>>>,
     blocked_until: Mutex<HashMap<String, u64>>,
+    identity: Identity,
+    dir: std::path::PathBuf,
+    queues: Mutex<HashMap<String, Queue>>,
+    pending_open: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    pending_pull: Mutex<HashMap<String, mpsc::Sender<Vec<Value>>>>,
+    miner: Mutex<bool>,
+    miners: Mutex<HashMap<String, u64>>,
+}
+
+struct Queue {
+    pub_hex: String,
+    owner: String,
+    msgs: Vec<Value>,
+}
+
+pub struct Inbox {
+    pub id: String,
+    pub host: String,
+    pub priv_key: [u8; 32],
+    pub pub_hex: String,
 }
 
 #[derive(Clone)]
@@ -51,9 +73,9 @@ impl Node {
         let mesh = Mesh::listen_on(bind_host, identity.clone(), name, advertise, port)?;
         mesh.set_route(profile, socks).map_err(|e| std::io::Error::other(e))?;
         let store = if dir.join("map.bin").is_file() {
-            Store::open(dir, identity, device_id)
+            Store::open(dir, identity.clone(), device_id)
         } else {
-            Store::create(dir, identity, device_id)
+            Store::create(dir, identity.clone(), device_id)
         }
         .map_err(|e| std::io::Error::other(e.0))?;
         let node = Self {
@@ -63,6 +85,13 @@ impl Node {
                 acks: Mutex::new(HashMap::new()),
                 audits: Mutex::new(HashMap::new()),
                 blocked_until: Mutex::new(HashMap::new()),
+                identity,
+                dir: dir.to_path_buf(),
+                queues: Mutex::new(load_queues(dir)),
+                pending_open: Mutex::new(HashMap::new()),
+                pending_pull: Mutex::new(HashMap::new()),
+                miner: Mutex::new(false),
+                miners: Mutex::new(HashMap::new()),
             }),
         };
         let handler = node.clone();
@@ -148,7 +177,11 @@ impl Node {
                     Err(err) => format!("err {err}"),
                 }
             }
-            _ => "err команда: status, contact, peers, files, chats, dial, put, chat".into(),
+            "sync" => match self.sync_drive() {
+                Ok(()) => "ok drive".into(),
+                Err(err) => format!("err {err}"),
+            },
+            _ => "err команда: status, contact, peers, files, chats, dial, put, chat, sync".into(),
         }
     }
 
@@ -210,6 +243,9 @@ impl Node {
     }
 
     pub fn replicate_to(&self, id: &str, contact_uri: &str) -> Result<(), String> {
+        if self.core.miner.lock().map(|flag| *flag).unwrap_or(false) {
+            return Ok(());
+        }
         let contact = parse_contact(contact_uri).map_err(|e| e.0)?;
         if !self.core.mesh.peers().iter().any(|fp| fp == &contact.fingerprint) {
             return Err("нет канала".into());
@@ -306,6 +342,206 @@ impl Node {
         }
     }
 
+    pub fn enable_miner(&self) {
+        if let Ok(mut flag) = self.core.miner.lock() {
+            *flag = true;
+        }
+        let node = self.clone();
+        self.core.mesh.set_on_up(std::sync::Arc::new(move |fp| node.announce_miner(fp)));
+        for fp in self.core.mesh.peers() {
+            self.announce_miner(&fp);
+        }
+    }
+
+    pub fn miner_supply(&self, fingerprint: &str) -> Option<u64> {
+        self.core.miners.lock().ok().and_then(|map| map.get(fingerprint).copied())
+    }
+
+    pub fn named_files(&self) -> Vec<(String, String, usize)> {
+        self.core
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.files().ok())
+            .map(|files| files.into_iter().map(|file| (file.id, file.name, file.replicas.len())).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn store_bytes(&self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        let id = format!("{}-{}", sanitize(name), now_ms());
+        self.core.store.lock().map_err(|_| "замок")?.add_file(&id, name, bytes).map_err(|e| e.0)?;
+        Ok(id)
+    }
+
+    pub fn read_bytes(&self, id: &str) -> Result<Vec<u8>, String> {
+        self.core.store.lock().map_err(|_| "замок")?.read_file(id).map_err(|e| e.0)
+    }
+
+    pub fn open_inbox(&self, host_fp: &str) -> Result<Inbox, String> {
+        let key = create_queue_key()?;
+        let (tx, rx) = mpsc::channel();
+        self.core.pending_open.lock().map_err(|_| "замок")?.insert(key.pub_hex.clone(), tx);
+        if let Err(err) = self.core.mesh.send_json(host_fp, &json!({"t": "smp_open", "pub": key.pub_hex})) {
+            self.core.pending_open.lock().ok().map(|mut pending| pending.remove(&key.pub_hex));
+            return Err(err);
+        }
+        let id = match rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(id) => id,
+            Err(_) => {
+                self.core.pending_open.lock().ok().map(|mut pending| pending.remove(&key.pub_hex));
+                return Err("Очередь SMP не открылась.".into());
+            }
+        };
+        Ok(Inbox { id, host: host_fp.to_string(), priv_key: key.priv_key, pub_hex: key.pub_hex })
+    }
+
+    pub fn send_sealed(&self, host_fp: &str, id: &str, recipient_pub: &[u8; 32], plain: &[u8]) -> Result<(), String> {
+        let sealed = nexxus_wire::seal_queue(recipient_pub, plain)?;
+        self.core.mesh.send_json(host_fp, &json!({
+            "t": "smp_send",
+            "id": id,
+            "eph": sealed.eph,
+            "nonce": sealed.nonce,
+            "ct": sealed.ct,
+        }))
+    }
+
+    pub fn pull_sealed(&self, host_fp: &str, id: &str, recipient_priv: &[u8; 32]) -> Result<Vec<Vec<u8>>, String> {
+        let (tx, rx) = mpsc::channel();
+        self.core.pending_pull.lock().map_err(|_| "замок")?.insert(id.to_string(), tx);
+        if let Err(err) = self.core.mesh.send_json(host_fp, &json!({"t": "smp_pull", "id": id})) {
+            self.core.pending_pull.lock().ok().map(|mut pending| pending.remove(id));
+            return Err(err);
+        }
+        let msgs = match rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(msgs) => msgs,
+            Err(_) => {
+                self.core.pending_pull.lock().ok().map(|mut pending| pending.remove(id));
+                return Err("Очередь SMP не ответила.".into());
+            }
+        };
+        msgs.iter()
+            .map(|message| {
+                open_queue(
+                    recipient_priv,
+                    &Sealed {
+                        eph: message["eph"].as_str().unwrap_or("").into(),
+                        nonce: message["nonce"].as_str().unwrap_or("").into(),
+                        ct: message["ct"].as_str().unwrap_or("").into(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub fn queue_record(&self, id: &str) -> Option<(String, String)> {
+        let queues = self.core.queues.lock().ok()?;
+        let queue = queues.get(id)?;
+        let dumped = serde_json::to_string(&queue.msgs).unwrap_or_default();
+        Some((queue.owner.clone(), dumped))
+    }
+
+    pub fn xftp_send(&self, fingerprint: &str, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        let (desc, bodies) = pack_xftp(name, bytes, &self.core.identity)?;
+        if desc.get("host").is_some() || desc.get("port").is_some() {
+            return Err("в описании XFTP не должно быть адреса".into());
+        }
+        let cids = desc["cids"].as_array().ok_or("описание XFTP не сошлось")?;
+        for (cid, body) in cids.iter().zip(&bodies) {
+            let cid = cid.as_str().unwrap_or("");
+            let (tx, rx) = mpsc::channel();
+            self.core.acks.lock().map_err(|_| "замок")?.insert(cid.to_string(), tx);
+            self.core.mesh.send_json(fingerprint, &json!({"t": "blob_put", "cid": cid, "data": b64(body)}))?;
+            if rx.recv_timeout(Duration::from_secs(8)).ok() != Some(true) {
+                return Err(format!("чанки XFTP не подтвердились: {cid}"));
+            }
+        }
+        self.core.mesh.send_json(fingerprint, &json!({"t": "xftp_desc", "desc": desc.clone()}))?;
+        Ok(desc)
+    }
+
+    pub fn sync_drive(&self) -> Result<(), String> {
+        let drive = self.core.dir.join("drive");
+        std::fs::create_dir_all(&drive).map_err(|e| e.to_string())?;
+        let index_path = self.core.dir.join("drive-index.json");
+        let mut index = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let mut store = self.core.store.lock().map_err(|_| "замок")?;
+        let files = store.files().map_err(|e| e.0)?;
+        let live: std::collections::HashSet<String> = files.iter().map(|file| file.id.clone()).collect();
+        let stale: Vec<String> = index
+            .iter()
+            .filter_map(|(name, meta)| {
+                let id = meta["id"].as_str().unwrap_or("");
+                if live.contains(id) { None } else { Some(name.clone()) }
+            })
+            .collect();
+        for name in stale {
+            let _ = std::fs::remove_file(drive.join(&name));
+            index.remove(&name);
+        }
+        for rec in &files {
+            let known = index.iter().find(|(_, meta)| meta["id"].as_str() == Some(rec.id.as_str())).map(|(name, _)| name.clone());
+            let mut name = if let Some(name) = known.clone() { name } else { safe_drive_name(&rec.name) };
+            if known.is_none() && index.contains_key(&name) {
+                name = format!("{}-{name}", &rec.id[..rec.id.len().min(8)]);
+            }
+            let dest = drive.join(&name);
+            let indexed = index.get(&name).and_then(|meta| meta["id"].as_str()) == Some(rec.id.as_str());
+            if indexed && !dest.exists() {
+                store.drop_file(&rec.id).map_err(|e| e.0)?;
+                index.remove(&name);
+                continue;
+            }
+            if dest.is_file() {
+                let disk = std::fs::read(&dest).map_err(|e| e.to_string())?;
+                let hash = hex::encode(Sha256::digest(&disk));
+                if hash == rec.hash {
+                    index.insert(name, json!({"id": rec.id, "hash": rec.hash}));
+                    continue;
+                }
+                if indexed {
+                    store.drop_file(&rec.id).map_err(|e| e.0)?;
+                    let id = format!("{}-{}", sanitize(&name), now_ms());
+                    let stored = store.add_file(&id, &rec.name, &disk).map_err(|e| e.0)?;
+                    index.insert(name, json!({"id": stored.id, "hash": stored.hash}));
+                    continue;
+                }
+            }
+            let bytes = store.read_file(&rec.id).map_err(|e| e.0)?;
+            std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+            index.insert(name, json!({"id": rec.id, "hash": rec.hash}));
+        }
+        let names: Vec<String> = std::fs::read_dir(&drive).map_err(|e| e.to_string())?.filter_map(|item| item.ok()?.file_name().into_string().ok()).collect();
+        for name in names {
+            if name.starts_with('.') || index.contains_key(&name) {
+                continue;
+            }
+            let full = drive.join(&name);
+            if !full.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
+            let id = format!("{}-{}", sanitize(&name), now_ms());
+            let stored = store.add_file(&id, &name, &bytes).map_err(|e| e.0)?;
+            index.insert(name, json!({"id": stored.id, "hash": stored.hash}));
+        }
+        std::fs::write(index_path, serde_json::to_vec_pretty(&Value::Object(index)).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn announce_miner(&self, fingerprint: &str) {
+        if !self.core.miner.lock().map(|flag| *flag).unwrap_or(false) {
+            return;
+        }
+        let supply = 64 * 1024 * 1024u64;
+        let sig = sign_miner(&self.core.identity, supply);
+        let _ = self.core.mesh.send_json(fingerprint, &json!({"t": "miner_ad", "supply": supply, "sig": sig}));
+    }
+
     fn on_packet(&self, fp: &str, obj: Value) {
         match obj["t"].as_str() {
             Some("blob_put") => {
@@ -367,9 +603,157 @@ impl Node {
             Some("ping") => {
                 let _ = self.core.mesh.send_json(fp, &json!({"t": "pong", "ts": now_ms()}));
             }
+            Some("miner_ad") => self.accept_miner(fp, &obj),
+            Some("smp_open") => self.accept_queue_open(fp, &obj),
+            Some("smp_opened") => {
+                let Some(pub_hex) = obj["pub"].as_str() else { return };
+                let Some(id) = obj["id"].as_str() else { return };
+                if let Some(tx) = self.core.pending_open.lock().ok().and_then(|mut pending| pending.remove(pub_hex)) {
+                    let _ = tx.send(id.to_string());
+                }
+            }
+            Some("smp_send") => self.accept_queue_send(&obj),
+            Some("smp_pull") => self.accept_queue_pull(fp, &obj),
+            Some("smp_msgs") => {
+                let Some(id) = obj["id"].as_str() else { return };
+                let Some(msgs) = obj["msgs"].as_array() else { return };
+                if let Some(tx) = self.core.pending_pull.lock().ok().and_then(|mut pending| pending.remove(id)) {
+                    let _ = tx.send(msgs.clone());
+                }
+            }
+            Some("xftp_desc") => self.accept_xftp(&obj["desc"]),
             _ => {}
         }
     }
+
+    fn accept_miner(&self, fp: &str, obj: &Value) {
+        let (Some(supply), Some(sig)) = (obj["supply"].as_u64(), obj["sig"].as_str()) else { return };
+        let Some(ed) = self.core.mesh.peer_ed(fp) else { return };
+        if !verify_miner(fp, &ed, supply, sig) {
+            return;
+        }
+        if let Ok(mut miners) = self.core.miners.lock() {
+            miners.insert(fp.to_string(), supply);
+        }
+    }
+
+    fn accept_queue_open(&self, fp: &str, obj: &Value) {
+        let Some(pub_hex) = obj["pub"].as_str() else { return };
+        if pub_hex.len() != 64 || !pub_hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return;
+        }
+        let id = hex::encode(rand16());
+        {
+            let Ok(mut queues) = self.core.queues.lock() else { return };
+            queues.insert(id.clone(), Queue { pub_hex: pub_hex.to_string(), owner: fp.to_string(), msgs: Vec::new() });
+            save_queues(&self.core.dir, &queues);
+        }
+        let _ = self.core.mesh.send_json(fp, &json!({"t": "smp_opened", "id": id, "pub": pub_hex}));
+    }
+
+    fn accept_queue_send(&self, obj: &Value) {
+        let Some(id) = obj["id"].as_str() else { return };
+        let (Some(eph), Some(nonce), Some(ct)) = (obj["eph"].as_str(), obj["nonce"].as_str(), obj["ct"].as_str()) else {
+            return;
+        };
+        if ct.len() > 100_000 {
+            return;
+        }
+        let Ok(mut queues) = self.core.queues.lock() else { return };
+        let Some(queue) = queues.get_mut(id) else { return };
+        if queue.msgs.len() >= 32 {
+            return;
+        }
+        queue.msgs.push(json!({"eph": eph, "nonce": nonce, "ct": ct}));
+        save_queues(&self.core.dir, &queues);
+    }
+
+    fn accept_queue_pull(&self, fp: &str, obj: &Value) {
+        let Some(id) = obj["id"].as_str() else { return };
+        let msgs = {
+            let Ok(mut queues) = self.core.queues.lock() else { return };
+            let Some(queue) = queues.get_mut(id) else { return };
+            if queue.owner != fp {
+                return;
+            }
+            let msgs = std::mem::take(&mut queue.msgs);
+            save_queues(&self.core.dir, &queues);
+            msgs
+        };
+        if self.core.mesh.send_json(fp, &json!({"t": "smp_msgs", "id": id, "msgs": msgs.clone()})).is_err() {
+            if let Ok(mut queues) = self.core.queues.lock() {
+                if let Some(queue) = queues.get_mut(id) {
+                    for message in msgs.into_iter().rev() {
+                        queue.msgs.insert(0, message);
+                    }
+                    save_queues(&self.core.dir, &queues);
+                }
+            }
+        }
+    }
+
+    fn accept_xftp(&self, desc: &Value) {
+        if !verify_desc(desc) {
+            return;
+        }
+        let Some(cids) = desc["cids"].as_array() else { return };
+        let mut bodies = Vec::new();
+        {
+            let Ok(store) = self.core.store.lock() else { return };
+            for cid in cids {
+                let Some(cid) = cid.as_str() else { return };
+                let Some(ct) = store.foreign_cipher(cid) else { return };
+                bodies.push(ct);
+            }
+        }
+        let Ok(plain) = unpack_xftp(desc, &bodies) else { return };
+        let name = safe_drive_name(desc["name"].as_str().unwrap_or("file.bin"));
+        let _ = self.store_bytes(&name, &plain);
+    }
+}
+
+fn load_queues(dir: &std::path::Path) -> HashMap<String, Queue> {
+    let Ok(text) = std::fs::read_to_string(dir.join("smp.json")) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(map) = value.as_object() else {
+        return HashMap::new();
+    };
+    map.iter()
+        .filter_map(|(id, item)| {
+            Some((
+                id.clone(),
+                Queue {
+                    pub_hex: item["pub"].as_str()?.to_string(),
+                    owner: item["owner"].as_str()?.to_string(),
+                    msgs: item["msgs"].as_array().cloned().unwrap_or_default(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn save_queues(dir: &std::path::Path, queues: &HashMap<String, Queue>) {
+    let mut map = serde_json::Map::new();
+    for (id, queue) in queues {
+        map.insert(id.clone(), json!({"pub": queue.pub_hex, "owner": queue.owner, "msgs": queue.msgs}));
+    }
+    let _ = std::fs::write(dir.join("smp.json"), serde_json::to_vec(&Value::Object(map)).unwrap_or_default());
+}
+
+fn safe_drive_name(name: &str) -> String {
+    let clean: String = name.chars().filter(|ch| *ch != '/' && *ch != '\\' && *ch != '\0').take(180).collect();
+    let clean = clean.trim();
+    if clean.is_empty() { "file.bin".into() } else { clean.to_string() }
+}
+
+fn rand16() -> [u8; 16] {
+    let mut raw = [0u8; 16];
+    let _ = getrandom::getrandom(&mut raw);
+    raw
 }
 
 fn answer_control(node: &Node, stream: TcpStream) -> std::io::Result<()> {

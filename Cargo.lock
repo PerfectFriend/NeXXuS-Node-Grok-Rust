@@ -329,7 +329,9 @@ dependencies = [
  "nexxus-crypto",
  "nexxus-net",
  "nexxus-vault",
+ "nexxus-wire",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -347,6 +349,19 @@ dependencies = [
  "hex",
  "hkdf",
  "nexxus-crypto",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "nexxus-wire"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "hex",
+ "hkdf",
+ "nexxus-crypto",
+ "nexxus-vault",
  "serde_json",
  "sha2",
 ]

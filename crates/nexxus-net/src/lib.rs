@@ -23,6 +23,7 @@ struct PeerOut {
 }
 
 pub type PacketHandler = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+pub type UpHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Inner {
     identity: Identity,
@@ -38,6 +39,8 @@ struct Inner {
     profile: Mutex<String>,
     socks_host: Mutex<String>,
     socks_port: Mutex<u16>,
+    eds: Mutex<HashMap<String, String>>,
+    on_up: Mutex<Option<UpHandler>>,
 }
 
 #[derive(Clone)]
@@ -68,6 +71,8 @@ impl Mesh {
                 profile: Mutex::new("lab".into()),
                 socks_host: Mutex::new(String::new()),
                 socks_port: Mutex::new(0),
+                eds: Mutex::new(HashMap::new()),
+                on_up: Mutex::new(None),
             }),
         };
         let background = mesh.clone();
@@ -148,6 +153,14 @@ impl Mesh {
 
     pub fn set_handler(&self, handler: PacketHandler) {
         *self.inner.on_packet.lock().expect("handler") = Some(handler);
+    }
+
+    pub fn set_on_up(&self, handler: UpHandler) {
+        *self.inner.on_up.lock().expect("up") = Some(handler);
+    }
+
+    pub fn peer_ed(&self, fingerprint: &str) -> Option<String> {
+        self.inner.eds.lock().ok().and_then(|eds| eds.get(fingerprint).cloned())
     }
 
     pub fn peers(&self) -> Vec<String> {
@@ -273,6 +286,10 @@ impl Mesh {
             .lock()
             .map_err(|_| "замок")?
             .insert(remote.fingerprint.clone(), PeerOut { tx });
+        self.inner.eds.lock().ok().map(|mut eds| eds.insert(remote.fingerprint.clone(), remote.ed_hex.clone()));
+        if let Some(on_up) = self.inner.on_up.lock().ok().and_then(|guard| guard.clone()) {
+            on_up(&remote.fingerprint);
+        }
         let fp = remote.fingerprint.clone();
         let mesh = self.clone();
         thread::spawn(move || {

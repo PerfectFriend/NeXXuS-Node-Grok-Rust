@@ -1,0 +1,19 @@
+[package]
+name = "nexxus-wire"
+version = "0.1.0"
+edition = "2021"
+description = "SMP queue seal and XFTP description. Not the simplexmq wire."
+license = "MIT"
+
+[dependencies]
+getrandom = "0.2"
+hex = "0.4"
+hkdf = "0.12"
+nexxus-crypto = { path = "../nexxus-crypto" }
+nexxus-vault = { path = "../nexxus-vault" }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+hex = "0.4"
+
